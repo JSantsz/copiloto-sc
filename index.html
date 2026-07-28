@@ -190,7 +190,7 @@
   .status-divida-badge.paga { background: var(--bravo-pos); color: var(--bravo-pos-text); }
   .status-divida-badge.liquidada { background: #e3e2f1; color: #6b6795; }
   .status-divida-badge.liquidada_por_credito { background: var(--bravo-amethyst); color: #ffffff; }
-  .status-divida-badge.estruturada { background: var(--bravo-viking); color: #124b4f; }
+  .status-divida-badge.estruturada { background: var(--bravo-amethyst); color: #ffffff; }
   .status-divida-badge.cancelada { background: var(--bravo-neg); color: var(--bravo-neg-text); }
   .status-divida-badge.desconhecido { background: #f1f0f6; color: #9a97b3; }
 
@@ -219,6 +219,7 @@
   .prazo-badge.atrasado { background: var(--bravo-neg); color: var(--bravo-neg-text); }
   .diff-badge.pos { background: var(--bravo-pos); color: var(--bravo-pos-text); }
   .diff-badge.neg { background: var(--bravo-neg); color: var(--bravo-neg-text); }
+  .diff-badge.neutro { background: var(--bravo-bg-light); color: var(--bravo-mid-pur); }
 
   ul.insights { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   ul.insights li {
@@ -634,29 +635,36 @@
     `;
     // Normaliza liquidada/liquidada_por_credito como "paga", igual já
     // fazemos nos cards individuais
+    // Lista de categorias "conhecidas", com card fixo próprio. Qualquer status
+    // que apareça nos dados mas não esteja aqui vira um card extra automático
+    // (em vez de simplesmente sumir, que foi o bug que já aconteceu com
+    // "estruturado" vs "estruturada" antes de percebermos que são a mesma coisa)
+    const CATEGORIAS_CONHECIDAS = ['em_aberto', 'paga', 'estruturada', 'cancelada'];
+
     function normalizarStatusParaContagem(status) {
       if (status === 'liquidada' || status === 'liquidada_por_credito') return 'paga';
+      if (status === 'estruturado') return 'estruturada'; // mesma coisa, só variação de gênero
       return status || 'desconhecido';
     }
 
-    const contagemPorStatus = { em_aberto: 0, paga: 0, estruturada: 0, cancelada: 0, desconhecido: 0 };
+    const contagemPorStatus = {};
     (d.dividas || []).forEach(x => {
       const s = normalizarStatusParaContagem(x.status_divida);
-      if (contagemPorStatus[s] == null) contagemPorStatus[s] = 0;
-      contagemPorStatus[s]++;
+      contagemPorStatus[s] = (contagemPorStatus[s] || 0) + 1;
     });
 
-    const cardsStatusExtras = contagemPorStatus.desconhecido > 0
-      ? `<div class="stat-card"><div class="valor">${contagemPorStatus.desconhecido}</div><div class="label">Desconhecido</div></div>`
-      : '';
+    const cardsStatusExtras = Object.keys(contagemPorStatus)
+      .filter(s => !CATEGORIAS_CONHECIDAS.includes(s))
+      .map(s => `<div class="stat-card"><div class="valor">${contagemPorStatus[s]}</div><div class="label">${STATUS_DIVIDA_LABEL[s] || s}</div></div>`)
+      .join('');
 
     statsGridDivida.innerHTML = `
       <div class="stat-card"><div class="valor">${formatarData(d.ultima_atualizacao_dividas)}</div><div class="label">Últ. atualiz. dívidas</div></div>
       <div></div>
-      <div class="stat-card"><div class="valor">${contagemPorStatus.paga}</div><div class="label">Paga</div></div>
-      <div class="stat-card"><div class="valor">${contagemPorStatus.cancelada}</div><div class="label">Cancelada</div></div>
-      <div class="stat-card"><div class="valor">${contagemPorStatus.em_aberto}</div><div class="label">Em aberto</div></div>
-      <div class="stat-card"><div class="valor">${contagemPorStatus.estruturada}</div><div class="label">Estruturada</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.paga || 0}</div><div class="label">Paga</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.cancelada || 0}</div><div class="label">Cancelada</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.em_aberto || 0}</div><div class="label">Em aberto</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.estruturada || 0}</div><div class="label">Estruturada</div></div>
       ${cardsStatusExtras}
     `;
   }
@@ -665,10 +673,12 @@
     const card = document.createElement('div');
     card.className = 'divida-card';
 
-    // Pro FILTRO: "Liquidada" e "Liquidada por crédito" contam como "Paga"
-    // (removemos essas opções do dropdown, unificando em "Paga")
+    // Pro FILTRO: "Liquidada" e "Liquidada por crédito" contam como "Paga";
+    // "estruturado" e "estruturada" são a mesma coisa (só variação de gênero)
     const statusParaFiltro = (d.status_divida === 'liquidada' || d.status_divida === 'liquidada_por_credito')
       ? 'paga'
+      : d.status_divida === 'estruturado'
+      ? 'estruturada'
       : (d.status_divida || 'desconhecido');
 
     card.dataset.statusDivida = statusParaFiltro;
@@ -683,7 +693,13 @@
       ? `<span class="prazo-badge ${d.prazo_status}">${d.prazo_status === 'no_prazo' ? 'No prazo' : 'Atrasado'}</span>`
       : '';
 
-    const diffClasse = d.diff_pp == null ? '' : (d.diff_pp >= 0 ? 'pos' : 'neg');
+    // A classificação (acima/abaixo/dentro do esperado) vem pronta do backend
+    // em d.status — ele já leva em conta não só a curva, mas também se o
+    // pago total atualização ficou pior que o plano. Não recalcula aqui pra
+    // não gerar inconsistência entre o texto e a cor do badge.
+    const diffClasse = d.status === 'acima_do_esperado' ? 'pos'
+      : d.status === 'abaixo_do_esperado' ? 'neg'
+      : 'neutro';
     const diffTexto = d.diff_pp == null ? '—' : (d.diff_pp > 0 ? '+' : '') + Number(d.diff_pp).toLocaleString('pt-BR', {maximumFractionDigits: 1}) + ' p.p.';
 
     const mesParaCurva = d.mes_da_divida ?? mesDoPlano;
@@ -695,18 +711,12 @@
 
     // No cabeçalho, usa texto qualitativo (acima/abaixo/dentro do esperado)
     // em vez do número exato de p.p. — o número exato já aparece embaixo,
-    // na seção "Comparação com a curva de desconto"
-    let descontoClasseHeader = '';
-    let descontoTextoHeader = 'Desconto dentro do esperado';
-    if (d.diff_pp != null) {
-      if (d.diff_pp > 3) {
-        descontoClasseHeader = 'pos';
-        descontoTextoHeader = 'Desconto acima do esperado';
-      } else if (d.diff_pp < -3) {
-        descontoClasseHeader = 'neg';
-        descontoTextoHeader = 'Desconto abaixo do esperado';
-      }
-    }
+    // na seção "Comparação com a curva de desconto". Usa o mesmo d.status
+    // de cima, pra ficar sempre consistente com o badge de baixo.
+    const descontoClasseHeader = diffClasse;
+    const descontoTextoHeader = d.status === 'acima_do_esperado' ? 'Desconto acima do esperado'
+      : d.status === 'abaixo_do_esperado' ? 'Desconto abaixo do esperado'
+      : 'Desconto dentro do esperado';
 
     const badgesExtrasPago = (ehPaga && d.status_resumo_pago)
       ? `${prazoBadge}<span class="diff-badge ${descontoClasseHeader}">${descontoTextoHeader}</span>`
