@@ -631,10 +631,31 @@
       <div class="stat-card"><div class="valor">${formatarNumero(d.parcelas_pagas)}</div><div class="label">Parcelas pagas</div></div>
       <div class="stat-card"><div class="valor">${formatarMoeda(d.poupanca_total)}</div><div class="label">Poupança total</div></div>
     `;
-    const quitadas = (d.dividas || []).filter(x => x.status_divida && x.status_divida !== 'em_aberto' && x.status_divida !== 'desconhecido').length;
+    // Normaliza liquidada/liquidada_por_credito como "paga", igual já
+    // fazemos nos cards individuais
+    function normalizarStatusParaContagem(status) {
+      if (status === 'liquidada' || status === 'liquidada_por_credito') return 'paga';
+      return status || 'desconhecido';
+    }
+
+    const contagemPorStatus = { em_aberto: 0, paga: 0, estruturada: 0, cancelada: 0, desconhecido: 0 };
+    (d.dividas || []).forEach(x => {
+      const s = normalizarStatusParaContagem(x.status_divida);
+      if (contagemPorStatus[s] == null) contagemPorStatus[s] = 0;
+      contagemPorStatus[s]++;
+    });
+
+    const cardsStatusExtras = contagemPorStatus.desconhecido > 0
+      ? `<div class="stat-card"><div class="valor">${contagemPorStatus.desconhecido}</div><div class="label">Desconhecido</div></div>`
+      : '';
+
     statsGridDivida.innerHTML = `
       <div class="stat-card"><div class="valor">${formatarData(d.ultima_atualizacao_dividas)}</div><div class="label">Últ. atualiz. dívidas</div></div>
-      <div class="stat-card"><div class="valor">${quitadas} de ${formatarNumero(d.qtd_dividas)}</div><div class="label">Dívidas pagas</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.em_aberto}</div><div class="label">Em aberto</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.paga}</div><div class="label">Paga</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.estruturada}</div><div class="label">Estruturada</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.cancelada}</div><div class="label">Cancelada</div></div>
+      ${cardsStatusExtras}
     `;
   }
 
