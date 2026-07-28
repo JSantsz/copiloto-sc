@@ -391,6 +391,7 @@
   const URL_VERIFICAR_EMAIL = 'https://ops.flows.gobravo.dev/webhook/verificar-email';
   const URL_CRIAR_SENHA = 'https://ops.flows.gobravo.dev/webhook/criar-senha';
   const URL_LOGIN = 'https://ops.flows.gobravo.dev/webhook/login';
+  const URL_REGISTRAR_USO = 'https://ops.flows.gobravo.dev/webhook/registrar-uso';
   const SESSION_KEY = 'assistente_divida_sc_session';
 
   let emailAtual = '';
@@ -651,10 +652,11 @@
 
     statsGridDivida.innerHTML = `
       <div class="stat-card"><div class="valor">${formatarData(d.ultima_atualizacao_dividas)}</div><div class="label">Últ. atualiz. dívidas</div></div>
-      <div class="stat-card"><div class="valor">${contagemPorStatus.em_aberto}</div><div class="label">Em aberto</div></div>
+      <div></div>
       <div class="stat-card"><div class="valor">${contagemPorStatus.paga}</div><div class="label">Paga</div></div>
-      <div class="stat-card"><div class="valor">${contagemPorStatus.estruturada}</div><div class="label">Estruturada</div></div>
       <div class="stat-card"><div class="valor">${contagemPorStatus.cancelada}</div><div class="label">Cancelada</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.em_aberto}</div><div class="label">Em aberto</div></div>
+      <div class="stat-card"><div class="valor">${contagemPorStatus.estruturada}</div><div class="label">Estruturada</div></div>
       ${cardsStatusExtras}
     `;
   }
@@ -883,6 +885,14 @@
 
       resultEl.classList.add('show');
       document.body.classList.add('has-result');
+
+      // Registra o uso em segundo plano, sem esperar resposta — não afeta
+      // em nada a velocidade da consulta principal, que já terminou aqui
+      fetch(URL_REGISTRAR_USO, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: sessao.email })
+      }).catch(() => {}); // ignora qualquer erro, é só telemetria
     } catch (err) {
       errorEl.textContent = "Não foi possível concluir a consulta. Tente novamente.";
       errorEl.classList.add('show');
