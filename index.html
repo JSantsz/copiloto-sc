@@ -882,7 +882,7 @@
 
       if (data.atualizado_ultimos_45_dias) {
         atualizacaoBanner.className = 'atualizacao-banner ok show';
-        atualizacaoBanner.textContent = `✅ Atualizado recentemente (última atualização em ${formatarData(data.data_ultima_atualizacao_plano)})`;
+        atualizacaoBanner.textContent = `✅ Atualizado recentemente (última atualização em ${formatarData(data.ultima_atualizacao_dividas)})`;
       } else {
         atualizacaoBanner.className = 'atualizacao-banner alerta show';
         atualizacaoBanner.textContent = `⚠️ Sem atualização nos últimos 45 dias. Já avisamos o time de Negociação — acompanhe o grupo para novidades.`;
