@@ -213,6 +213,14 @@
   .divida-subsection-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: #2c2a45; margin-bottom: 6px; }
   .divida-subsection-row:last-child { margin-bottom: 0; }
   .divida-subsection-texto { font-size: 13px; color: #55516f; line-height: 1.5; }
+  .parcelas-tabela-wrap { max-height: 260px; overflow-y: auto; border: 1px solid #e8e6f5; border-radius: 8px; margin-top: 8px; }
+  .parcelas-tabela { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .parcelas-tabela th { position: sticky; top: 0; background: var(--bravo-bg-light); text-align: left; padding: 6px 10px; font-weight: 700; color: #55516f; }
+  .parcelas-tabela td { padding: 5px 10px; border-top: 1px solid #f0eef9; color: #302d71; }
+  .parcelas-status { font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
+  .parcelas-status.paid { background: var(--bravo-pos); color: var(--bravo-pos-text); }
+  .parcelas-status.pending { background: var(--bravo-bg-light); color: var(--bravo-mid-pur); }
+  .parcelas-status.failed { background: var(--bravo-neg); color: var(--bravo-neg-text); }
 
   .prazo-badge, .diff-badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
   .prazo-badge.no_prazo { background: var(--bravo-pos); color: var(--bravo-pos-text); }
@@ -615,7 +623,7 @@
     paga: 'Paga',
     liquidada: 'Liquidada',
     liquidada_por_credito: 'Liquidada por crédito',
-    estruturada: 'Estruturada',
+    estruturada: 'Estruturado em andamento',
     cancelada: 'Cancelada',
     desconhecido: 'Desconhecido'
   };
@@ -666,6 +674,36 @@
       <div class="stat-card"><div class="valor">${contagemPorStatus.em_aberto || 0}</div><div class="label">Em aberto</div></div>
       <div class="stat-card"><div class="valor">${contagemPorStatus.estruturada || 0}</div><div class="label">Estruturada</div></div>
       ${cardsStatusExtras}
+    `;
+  }
+
+  const PARCELA_STATUS_LABEL = { paid: 'Pago', pending: 'Pendente', failed: 'Falhou' };
+  const PARCELA_DESTINO_LABEL = { bank: 'Banco', commission: 'Comissão' };
+
+  function criarTabelaParcelasEstruturado(parcelas) {
+    if (!parcelas || !parcelas.length) return '';
+    const linhas = parcelas.map(p => `
+      <tr>
+        <td>${p.numero ?? '—'}</td>
+        <td>${formatarData(p.data)}</td>
+        <td>${formatarMoeda(p.valor)}</td>
+        <td>${PARCELA_DESTINO_LABEL[p.destino] || p.destino || '—'}</td>
+        <td><span class="parcelas-status ${p.status || ''}">${PARCELA_STATUS_LABEL[p.status] || p.status || '—'}</span></td>
+      </tr>
+    `).join('');
+
+    return `
+      <div class="divida-subsection">
+        <div class="divida-subsection-title">Parcelas do pagamento estruturado</div>
+        <div class="parcelas-tabela-wrap">
+          <table class="parcelas-tabela">
+            <thead>
+              <tr><th>Nº</th><th>Data</th><th>Valor</th><th>Destino</th><th>Status</th></tr>
+            </thead>
+            <tbody>${linhas}</tbody>
+          </table>
+        </div>
+      </div>
     `;
   }
 
@@ -771,6 +809,7 @@
         </div>
         ${d.comparacao_texto ? `<div class="divida-subsection-texto">${d.comparacao_texto}</div>` : ''}
       </div>
+      ${criarTabelaParcelasEstruturado(d.parcelas_estruturado)}
     `;
     return card;
   }
