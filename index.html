@@ -729,10 +729,10 @@
 
     card.dataset.statusDivida = statusParaFiltro;
 
-    // Pro BADGE visual do card: mantém o status real, os operadores
-    // precisam diferenciar liquidada de liquidada por crédito de paga
-    // Antes mostrava o status real (Liquidada / Liquidada por crédito).
-    // Agora usa o mesmo normalizado do filtro — tudo aparece como "Paga".
+    // Pro BADGE visual do card: mostra "Paga" normalizado (igual ao filtro),
+    // mas quando o status real for "liquidada_por_credito" adiciona uma
+    // segunda badge só pra isso ("Dívida quitada com crédito", ver abaixo),
+    // igual ao CRM do Berex mostra várias tags juntas no card.
     const statusParaExibicao = statusParaFiltro;
 
     const prazoBadge = d.prazo_status
@@ -773,6 +773,7 @@
         <span class="divida-banco">${d.banco}</span>
         <div class="divida-badges">
           <span class="status-divida-badge ${statusParaExibicao}">${STATUS_DIVIDA_LABEL[statusParaExibicao] || statusParaExibicao}</span>
+          ${d.status_divida === 'liquidada_por_credito' ? '<span class="status-divida-badge liquidada_por_credito">Dívida quitada com crédito</span>' : ''}
           ${badgesExtrasPago}
         </div>
       </div>
