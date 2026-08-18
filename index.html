@@ -668,6 +668,7 @@
 
   function renderStats(d) {
     statsGridCliente.innerHTML = `
+      <div class="stat-card" style="grid-column: 1 / -1;"><div class="valor">${d.nome_cliente || '—'}</div><div class="label">Nome do cliente</div></div>
       <div class="stat-card"><div class="valor">${formatarMoeda(d.divida_total)}</div><div class="label">Dívida total</div></div>
       <div class="stat-card"><div class="valor">${formatarNumero(d.qtd_dividas)}</div><div class="label">Qtd. dívidas</div></div>
       <div class="stat-card"><div class="valor">${formatarNumero(d.duracao_programa)}</div><div class="label">Duração prog.</div></div>
