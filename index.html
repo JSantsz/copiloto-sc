@@ -223,6 +223,7 @@
   .status-divida-badge.estruturada { background: var(--bravo-amethyst); color: #ffffff; }
   .status-divida-badge.cancelada { background: var(--bravo-neg); color: var(--bravo-neg-text); }
   .status-divida-badge.desconhecido { background: #f1f0f6; color: #9a97b3; }
+  .status-divida-badge.acordo_quebrado { background: #e5484d; color: #ffffff; }
 
   .divida-info-box {
     border: 1px solid var(--border-light); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
@@ -824,6 +825,7 @@
         <span class="divida-banco">${d.banco}</span>
         <div class="divida-badges">
           <span class="status-divida-badge ${statusParaExibicao}">${STATUS_DIVIDA_LABEL[statusParaExibicao] || statusParaExibicao}</span>
+          ${(d.acordo_quebrado === true || d.acordo_quebrado === 'true' || (Array.isArray(d.labels) && d.labels.includes('broken_agreement'))) ? '<span class="status-divida-badge acordo_quebrado">Acordo quebrado</span>' : ''}
           ${(d.liquidado_com_credito || d.status_divida === 'liquidada_por_credito') ? '<span class="status-divida-badge liquidada_por_credito">Pago com crédito</span>' : ''}
           ${badgesExtrasPago}
         </div>
