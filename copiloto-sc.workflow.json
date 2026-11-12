@@ -1,0 +1,591 @@
+{
+  "name": "Copiloto - SC",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/resumo-dividas-sc",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "https://copiloto-sc.vercel.app"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -464,
+        0
+      ],
+      "id": "b33cf9fd-dbb3-4a73-ac5e-451130fc0925",
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const br = ($input.first().json.br || '').trim().toUpperCase();\nconst BR_REGEX = /^BR\\d{7}$/;\n\nif (!BR_REGEX.test(br)) {\n  throw new Error(`BR inválido: \"${br}\". Formato esperado: BR seguido de 7 dígitos.`);\n}\n\nreturn [{ json: { br } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        -16
+      ],
+      "id": "2a4c0ddb-7495-4353-adc9-db2e97ec5bc7",
+      "name": "validarBR"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "projectId": {
+          "__rl": true,
+          "value": "<SEU_PROJETO_GCP>",
+          "mode": "list",
+          "cachedResultName": "<SEU_PROJETO_GCP>",
+          "cachedResultUrl": "https://console.cloud.google.com/bigquery?project=<SEU_PROJETO_GCP>"
+        },
+        "sqlQuery": "WITH cr_filtered AS (\n  SELECT *\n  FROM berex.credit_repairs\n  WHERE country = 'br'\n    AND bank_reference = '{{ $json.br }}'\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY bank_reference ORDER BY (status = 'deprecated'), updated_at DESC) = 1\n)\nSELECT\n    cr.bank_reference AS br,\n    pi.full_name AS nome_cliente,\n    cr.status AS status_berex,\n    cr.sub_state,\n    cr.started_at AS data_inicio,\n    COALESCE(ad.nova_duracao_programa, cr.program_duration) AS duracao_programa,\n    cr.total_debt_amount AS divida_total,\n    ad.data_aditivo,\n    ad.qtd_aditivos,\n    ad.qtd_aditivos > 0 AS teve_aditivo,\n    -- Mês do programa:\n    --  - Sem aditivo: o mês de entrada (started_at) é o da taxa de ativação, não conta.\n    --    Ex.: entrou em maio → junho = mês 1 ... novembro = mês 6.\n    --  - Com aditivo: o mês do aditivo já conta como mês 1 (regra anterior mantida).\n    LEAST(GREATEST(\n      IF(ad.data_aditivo IS NOT NULL,\n         DATE_DIFF(CURRENT_DATE(), CAST(ad.data_aditivo AS DATE), MONTH) + 1,\n         DATE_DIFF(CURRENT_DATE(), cr.started_at, MONTH)),\n    1), 60) AS mes_do_plano,\n    pb.ultimo_pagamento_banco AS data_ultima_atualizacao_plano,\n    upd.ultima_atualizacao_dividas >= DATE_SUB(CURRENT_DATE(), INTERVAL 45 DAY) AS atualizado_ultimos_45_dias,\n    upd.ultima_atualizacao_dividas,\n    bt.balance AS poupanca_total,\n    SAFE_CAST(sp.payment AS FLOAT64) AS pago_total,\n    SAFE_CAST(sp.payment_to_bank AS FLOAT64) AS pago_banco_total_plano,\n    SAFE_CAST(sp.discount AS FLOAT64) AS desconto_total_plano,\n    COALESCE(\n        SAFE_CAST(\n            REPLACE(REGEXP_EXTRACT(ad.novo_aporte_mensal_raw, r'R\\$([0-9,]+\\.[0-9]+)'), ',', '')\n            AS FLOAT64\n        ),\n        SAFE_CAST(sp.monthly_payment AS FLOAT64)\n    ) AS aporte_mensal,\n    dep.qtd_depositos AS qtd_depositos_reais,\n    dep.soma_todos_depositos AS soma_todos_depositos_reais,\n    dep.primeiro_deposito_valor AS primeiro_deposito_valor_reais,\n    sp.debts AS debts_json_raw,\n    ad_todos.lista_new_debts AS aditivo_new_debts_raw\nFROM cr_filtered cr\nLEFT JOIN vanex_public.leads_lead ll ON ll.tracker_id = cr.tracker_id\nLEFT JOIN (\n    -- Nome do cliente: mais confiável do que vanex_public.leads_lead.names,\n    -- que costuma vir vazio nesse tracker_id específico em vários clientes.\n    -- Aqui liga direto por credit_repair_id (sem depender do tracker_id).\n    SELECT *\n    FROM berex.personal_information\n    WHERE credit_repair_id = (SELECT id FROM cr_filtered)\n    QUALIFY ROW_NUMBER() OVER (PARTITION BY credit_repair_id ORDER BY updated_at DESC) = 1\n) pi ON pi.credit_repair_id = cr.id\nLEFT JOIN vanex_public.settlement_plan sp ON sp.lead_id = ll.id AND sp.winner = TRUE\nLEFT JOIN (\n    SELECT bank_reference, ROUND(SUM(in_favor_for_balance * amount), 2) AS balance\n    FROM dealer_public.bank_transactions\n    WHERE country = 'br'\n      AND bank_reference = (SELECT bank_reference FROM cr_filtered)\n    GROUP BY bank_reference\n) bt ON bt.bank_reference = cr.bank_reference\nLEFT JOIN (\n    SELECT bank_reference, MAX(transaction_time) AS ultimo_pagamento_banco\n    FROM dealer_public.bank_transactions\n    WHERE country = 'br'\n      AND description_type = 'PAGAMENTO AO BANCO'\n      AND bank_reference = (SELECT bank_reference FROM cr_filtered)\n    GROUP BY bank_reference\n) pb ON pb.bank_reference = cr.bank_reference\nLEFT JOIN (\n    SELECT\n        bank_reference,\n        COUNT(*) AS qtd_depositos,\n        SUM(amount) AS soma_todos_depositos,\n        MAX(IF(rn = 1, amount, NULL)) AS primeiro_deposito_valor\n    FROM (\n        SELECT\n            bank_reference,\n            amount,\n            ROW_NUMBER() OVER (PARTITION BY bank_reference ORDER BY transaction_time ASC) AS rn\n        FROM dealer_public.bank_transactions\n        WHERE country = 'br'\n          AND description_type = 'DEPOSITO'\n          AND bank_reference = (SELECT bank_reference FROM cr_filtered)\n    )\n    GROUP BY bank_reference\n) dep ON dep.bank_reference = cr.bank_reference\nLEFT JOIN (\n    SELECT\n        credit_repair_id,\n        MAX(accepted_at) AS data_aditivo,\n        COUNT(*) AS qtd_aditivos,\n        ARRAY_AGG(\n            CAST(JSON_VALUE(new_credit_repair_data, '$.program_duration') AS INT64)\n            ORDER BY accepted_at DESC LIMIT 1\n        )[OFFSET(0)] AS nova_duracao_programa,\n        ARRAY_AGG(\n            JSON_VALUE(new_credit_repair_data, '$.monthly_payment')\n            ORDER BY accepted_at DESC LIMIT 1\n        )[OFFSET(0)] AS novo_aporte_mensal_raw\n    FROM berex.addendum\n    WHERE state = 'approved'\n      AND credit_repair_id = (SELECT id FROM cr_filtered)\n    GROUP BY credit_repair_id\n) ad ON ad.credit_repair_id = cr.id\nLEFT JOIN (\n    SELECT credit_repair_id, MAX(last_activity_date) AS ultima_atualizacao_dividas\n    FROM berex.credit_repair_debts\n    WHERE credit_repair_id = (SELECT id FROM cr_filtered)\n    GROUP BY credit_repair_id\n) upd ON upd.credit_repair_id = cr.id\nLEFT JOIN (\n    SELECT\n        credit_repair_id,\n        ARRAY_AGG(new_debts ORDER BY accepted_at DESC) AS lista_new_debts\n    FROM berex.addendum\n    WHERE state = 'approved'\n      AND credit_repair_id = (SELECT id FROM cr_filtered)\n    GROUP BY credit_repair_id\n) ad_todos ON ad_todos.credit_repair_id = cr.id\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        400,
+        -128
+      ],
+      "id": "5180df3f-cc2b-430a-860c-ed47e4045e7b",
+      "name": "BuscarDividasCliente",
+      "retryOnFail": true,
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_ME",
+          "name": "BQ - Google Sheets"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const planoItems = $('BuscarDividasCliente').all();\nconst respostaPostgres = $('BuscarDividasPostgres').first().json;\n\nif (planoItems.length === 0) {\n  throw new Error('Nenhum plano encontrado para esse BR.');\n}\n\nconst plano = planoItems[0].json;\n\nconst cols = (respostaPostgres.data?.cols || []).map(c => c.name);\nconst rows = respostaPostgres.data?.rows || [];\nconst dividasPostgres = rows.map(row => {\n  const obj = {};\n  cols.forEach((nome, i) => { obj[nome] = row[i]; });\n  return obj;\n});\n\n// --- Nível 2: Snapshot do plano original (settlement_plan.debts) ---\n// Congelado no momento em que o plano foi criado. Casa por uid.\nlet snapshotPorUid = {};\ntry {\n  const debtsRaw = plano.debts_json_raw;\n  const debtsArray = typeof debtsRaw === 'string' ? JSON.parse(debtsRaw) : (debtsRaw || []);\n  for (const entry of debtsArray) {\n    if (entry && entry.id) {\n      snapshotPorUid[entry.id] = {\n        mes_previsto_quitacao_snapshot: entry.settlement_month ?? null,\n        data_estimada_quitacao_snapshot: entry.estimated_settlement_date ?? null,\n        payment_to_bank_snapshot: entry.payment_to_bank != null ? Number(entry.payment_to_bank) : null,\n        reduction_commission_snapshot: entry.reduction_commission != null ? Number(entry.reduction_commission) : null\n      };\n    }\n  }\n} catch (e) {\n  snapshotPorUid = {};\n}\n\n// --- Nível 3: Snapshot do aditivo mais recente (berex.addendum.new_debts) ---\n// Congelado no momento em que o aditivo foi aceito. Cobre dívidas que\n// entraram DEPOIS do plano original (por isso não têm snapshot no nível 2).\n// Não dá pra casar por uid aqui — o \"id\" dentro desse JSON não é o mesmo\n// uid do credit_repair_debts, e o \"old_id\" costuma vir 0 pra dívidas\n// tratadas como \"novas\" pelo aditivo. O cruzamento confiável é por\n// banco (financial_entity) + valor (current_debt_amount ≈ valor_original).\nfunction limparValorMonetario(str) {\n  if (str == null) return null;\n  const numerico = String(str).replace(/[^0-9.,]/g, '');\n  const semMilhar = numerico.replace(/,/g, '');\n  const n = parseFloat(semMilhar);\n  return isNaN(n) ? null : n;\n}\n\nlet aditivoEntries = [];\ntry {\n  const listaEntries = plano.aditivo_new_debts_raw; // já vem como lista \"achatada\" de objetos\n  if (Array.isArray(listaEntries)) {\n    for (const entry of listaEntries) {\n      if (!entry || typeof entry !== 'object') continue;\n      aditivoEntries.push({\n        financial_entity: entry.financial_entity != null ? Number(entry.financial_entity) : null,\n        valor: limparValorMonetario(entry.current_debt_amount),\n        mes_previsto_quitacao_aditivo: entry.settlement_month ?? null,\n        data_estimada_quitacao_aditivo: entry.estimated_settlement_date ?? null\n      });\n    }\n  }\n} catch (e) {\n  aditivoEntries = [];\n}\n\nfunction buscarNoAditivo(bancoId, valorOriginal) {\n  if (bancoId == null || valorOriginal == null) return null;\n  return aditivoEntries.find(e =>\n    e.financial_entity === Number(bancoId) &&\n    e.valor != null &&\n    Math.abs(e.valor - valorOriginal) < 0.02\n  ) || null;\n}\n\nfunction classificarStatus(d) {\n  if (['new', 'negotiation'].includes(d.estado_divida_raw)) return 'em_aberto';\n  if (d.estado_divida_raw === 'cancelled') return 'cancelada';\n  if (d.estado_divida_raw === 'liquidation_structured_payment') return 'estruturada';\n  if (d.liquidated_with_structured_payments) return 'estruturada';\n  if (d.estado_divida_raw === 'paid') return 'paga';\n  if (d.estado_divida_raw == null) return 'desconhecido';\n  return 'liquidada';\n}\n\nfunction estimarComissao(valorOriginal, valorPago) {\n  if (valorOriginal == null || valorPago == null) return null;\n  const economia = valorOriginal - valorPago;\n  if (economia <= 0) return 0; // sem economia (ou pagou mais que o original) — sem comissão de êxito\n  return Math.round(economia * 100 * 0.175) / 100;\n}\n\n// NOVO — tags da dívida (berex.credit_repair_debts.labels).\n// O SQL devolve \"labels\" como texto separado por vírgula e\n// \"acordo_quebrado\" como booleano. Parse defensivo porque o Metabase\n// às vezes devolve booleano como string.\nfunction parseLabels(raw) {\n  if (raw == null) return [];\n  if (Array.isArray(raw)) return raw.map(s => String(s).trim()).filter(Boolean);\n  return String(raw).replace(/[{}\\[\\]\"]/g, '').split(',').map(s => s.trim()).filter(Boolean);\n}\n\n// --- Cálculo de parcelas pagas, respeitando mudanças de aporte ao longo\n// do tempo (aditivos que aumentaram ou diminuíram o valor da parcela) ---\n//\n// Antes: somava TODOS os depósitos e dividia pelo aporte ATUAL — funciona\n// só se o aporte nunca mudou. Se o cliente pagou parte no valor antigo e\n// parte no valor novo, isso super ou subestima a contagem.\n//\n// Agora: monta uma linha do tempo de \"qual era o aporte vigente em cada\n// período\" (original → 1º aditivo → 2º aditivo → ...), e cada depósito é\n// convertido em parcelas usando o aporte que valia NA DATA daquele depósito.\nfunction calcularParcelasPagas(plano) {\n  const listaDepositos = Array.isArray(plano.lista_depositos_raw) ? plano.lista_depositos_raw : [];\n  const timelineAditivos = Array.isArray(plano.timeline_aportes_raw) ? plano.timeline_aportes_raw : [];\n\n  // Sem dados suficientes pra fazer o cálculo certo: reserva antiga\n  if (listaDepositos.length === 0 || !plano.aporte_mensal) {\n    return Math.max((plano.qtd_depositos_reais || 0) - 1, 0);\n  }\n\n  // Lista dos valores de aporte que já existiram (original + cada mudança\n  // por aditivo). Não precisa de data aqui — a escolha de qual aporte usar\n  // pra cada depósito é feita pelo VALOR, não pela data (ver função abaixo).\n  const aportesConhecidos = [plano.aporte_mensal_original ?? plano.aporte_mensal];\n  for (const item of timelineAditivos) {\n    const aporte = limparValorMonetario(item.aporte_raw);\n    if (aporte != null && aporte > 0) aportesConhecidos.push(aporte);\n  }\n\n  // Pra cada depósito, escolhe — entre os aportes já usados nesse plano —\n  // aquele que faz o valor bater mais perto de um número inteiro de\n  // parcelas. Isso é mais confiável que escolher só pela data: às vezes um\n  // depósito acontece DEPOIS da data do aditivo mas ainda no valor antigo\n  // (atraso de um ciclo de cobrança), e escolher por data classificaria\n  // errado, inflando a conta.\n  function parcelasDoDeposito(valor) {\n    let melhorAporte = aportesConhecidos[0];\n    let menorResto = Infinity;\n    for (const aporte of aportesConhecidos) {\n      const parcelas = valor / aporte;\n      const resto = Math.abs(parcelas - Math.round(parcelas));\n      if (resto < menorResto) {\n        menorResto = resto;\n        melhorAporte = aporte;\n      }\n    }\n    return valor / melhorAporte;\n  }\n\n  // O primeiro depósito (cronologicamente) é SEMPRE a taxa de ativação do\n  // cliente — nunca conta como parcela, não importa o valor dele. Regra\n  // confirmada com o time.\n  let totalParcelas = 0;\n  listaDepositos.forEach((dep, i) => {\n    if (i === 0) return; // pula a entrada\n    totalParcelas += parcelasDoDeposito(Number(dep.valor));\n  });\n\n  return Math.floor(totalParcelas);\n}\n\nconst dividas = dividasPostgres.map(d => {\n  const snapshot = snapshotPorUid[d.debt_uid] || null;\n\n  // Comissão PROJETADA associada ao valor inicial (plano): sempre estimada\n  // em cima da economia total esperada (dívida - pagamento inicial) * 17,5%.\n  // Não usa a comissão real do Postgres aqui — ela reflete outra coisa\n  // (comissão já realizada até agora), não a comissão projetada do plano\n  // inteiro. Confirmado batendo exato com a tela do Berex: (86.679,86 -\n  // 8.667,99) * 0,175 + 8.667,99 = 22.320,07.\n  const comissaoParaPlano = estimarComissao(d.valor_original, d.valor_pago_banco_inicial);\n\n  // Prioridade: valor CADASTRADO no plano de liquidação (payment_to_bank +\n  // reduction_commission, congelados na época em que o plano foi criado).\n  // Só cai pro cálculo estimado se essa dívida não tiver snapshot no plano\n  // (ex: entrou depois via aditivo, ou o tracker_id não bate com nenhum lead).\n  const pagoTotalPadrao = (snapshot && snapshot.payment_to_bank_snapshot != null)\n    ? Math.round((snapshot.payment_to_bank_snapshot + (snapshot.reduction_commission_snapshot || 0)) * 100) / 100\n    : (d.valor_pago_banco_inicial != null\n        ? Math.round((d.valor_pago_banco_inicial + (comissaoParaPlano || 0)) * 100) / 100\n        : null);\n\n  const houveMudanca = d.valor_pago_banco_inicial != null && d.valor_pago_banco_atual != null\n    && Math.abs(d.valor_pago_banco_inicial - d.valor_pago_banco_atual) > 0.01;\n   const comissaoAtualizada = houveMudanca\n    ? estimarComissao(d.valor_original, d.valor_pago_banco_atual)\n    : null;\n  const pagoTotalAtualizacao = houveMudanca\n    ? Math.round((d.valor_pago_banco_atual + (comissaoAtualizada || 0)) * 100) / 100\n    : null;\n\n  // --- Cadeia de fallback pra mes_previsto_quitacao: ao vivo → snapshot do\n  // ADITIVO (mais recente, se existir) → snapshot do plano original ---\n  // Importante: o aditivo vem ANTES do plano no fallback, porque ele é mais\n  // recente — se um aditivo atualizou o prazo dessa dívida, essa atualização\n  // tem que vencer a previsão antiga do plano original.\n  let mesPrevistoFinal = null;\n  let origemMesPrevisto = null;\n  let dataEstimadaFinal = null;\n\n  if (d.mes_previsto_quitacao != null) {\n    mesPrevistoFinal = d.mes_previsto_quitacao;\n    origemMesPrevisto = 'live';\n  } else {\n    const matchAditivo = buscarNoAditivo(d.banco_id, d.valor_original);\n    if (matchAditivo && matchAditivo.mes_previsto_quitacao_aditivo != null) {\n      mesPrevistoFinal = matchAditivo.mes_previsto_quitacao_aditivo;\n      origemMesPrevisto = 'snapshot_aditivo';\n      dataEstimadaFinal = matchAditivo.data_estimada_quitacao_aditivo ?? null;\n    } else if (snapshot && snapshot.mes_previsto_quitacao_snapshot != null) {\n      mesPrevistoFinal = snapshot.mes_previsto_quitacao_snapshot;\n      origemMesPrevisto = 'snapshot_plano';\n      dataEstimadaFinal = snapshot.data_estimada_quitacao_snapshot ?? null;\n    }\n  }\n\n  // Desconto real: usa o \"pago total atualização\" (que já inclui a comissão)\n  // quando ele existir — antes usava o valor bruto sem comissão, o que não\n  // batia com o R$ mostrado no card como \"Pago total atualização\"\n  const baseParaDesconto = pagoTotalAtualizacao != null ? pagoTotalAtualizacao : pagoTotalPadrao;\n\n  // Parcelas do pagamento estruturado (só existe pra dívidas nesse regime).\n  // O Postgres já devolve como JSON via json_agg; parse defensivo caso\n  // venha como string em vez de objeto já parseado.\n  let parcelasEstruturado = null;\n  if (d.parcelas_estruturado_raw) {\n    try {\n      parcelasEstruturado = typeof d.parcelas_estruturado_raw === 'string'\n        ? JSON.parse(d.parcelas_estruturado_raw)\n        : d.parcelas_estruturado_raw;\n    } catch (e) {\n      parcelasEstruturado = null;\n    }\n  }\n\n  // NOVO — tags e flag de acordo quebrado\n  const labels = parseLabels(d.labels);\n  const acordoQuebrado = d.acordo_quebrado === true\n    || d.acordo_quebrado === 'true'\n    || labels.includes('broken_agreement');\n\n  return {\n    banco: d.banco,\n    banco_id: d.banco_id,\n    numero_contrato: d.numero_contrato,\n    valor_original: d.valor_original,\n    valor_pago_banco: d.valor_pago_banco_atual,\n    desconto_atual: d.valor_original && baseParaDesconto != null ? Math.round((1 - baseParaDesconto / d.valor_original) * 10000) / 10000 : null,\n    comissao_sucesso: d.comissao_sucesso,\n    pago_total_padrao: pagoTotalPadrao,\n    pago_total_atualizacao: pagoTotalAtualizacao,\n    current_balance_postgres: d.current_balance,\n    estado_divida_raw: d.estado_divida_raw,\n    status_divida: classificarStatus(d),\n    liquidado_com_credito: Boolean(d.liquidated_with_credit),\n    data_ultima_atualizacao_divida: d.data_ultima_atualizacao_divida,\n    mes_previsto_quitacao: mesPrevistoFinal,\n    mes_previsto_quitacao_origem: origemMesPrevisto,\n    data_estimada_quitacao_snapshot: dataEstimadaFinal,\n    parcelas_estruturado: parcelasEstruturado,\n    acordo_quebrado: acordoQuebrado, // NOVO\n    labels: labels                   // NOVO\n  };\n});\n\n// --- Ordenação: dívidas em aberto aparecem primeiro ---\nconst prioridadeStatus = {\n  em_aberto: 0,\n  desconhecido: 1,\n  estruturado: 2,\n  estruturada: 3,\n  paga: 4,\n  liquidada: 5,\n  cancelada: 6\n};\n\ndividas.sort((a, b) => {\n  const pa = prioridadeStatus[a.status_divida] ?? 99;\n  const pb = prioridadeStatus[b.status_divida] ?? 99;\n  return pa - pb;\n});\n\nconst resultadoParcelas = calcularParcelasPagas(plano);\n\nreturn [{\n  json: {\n    br: plano.br,\n    nome_cliente: plano.nome_cliente,\n    status_berex: plano.status_berex,\n    sub_state: plano.sub_state,\n    data_inicio: plano.data_inicio,\n    mes_do_plano: plano.mes_do_plano,\n    duracao_programa: plano.duracao_programa,\n    divida_total: plano.divida_total,\n    aporte_mensal: plano.aporte_mensal,\n    qtd_dividas: dividas.length,\n    // Sem aditivo, mes_do_plano já não conta o mês de ativação → parcelas esperadas = mês do plano.\n    // Com aditivo, mantém a regra anterior (mês do aditivo conta como mês 1).\n    parcelas_esperadas: plano.teve_aditivo\n      ? Math.max((plano.mes_do_plano || 0) - 1, 0)\n      : Math.max(plano.mes_do_plano || 0, 0),\n    parcelas_pagas: resultadoParcelas,\n    teve_aditivo: plano.teve_aditivo,\n    data_aditivo: plano.data_aditivo,\n    data_ultima_atualizacao_plano: plano.data_ultima_atualizacao_plano,\n    atualizado_ultimos_45_dias: plano.atualizado_ultimos_45_dias,\n    ultima_atualizacao_dividas: plano.ultima_atualizacao_dividas,\n    poupanca_total: plano.poupanca_total,\n    pago_total: plano.pago_total,\n    pago_banco_total_plano: plano.pago_banco_total_plano,\n    desconto_total_plano: plano.desconto_total_plano,\n    dividas: dividas\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        848,
+        0
+      ],
+      "id": "6db8b4bf-14eb-4505-8b15-1a609b9f34f1",
+      "name": "AgruparDividas"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: \"Curva de Desconto — Lookup + Diff\"\n// Objetivo: comparar o desconto atual de cada dívida com o\n// desconto projetado pela curva (banco + mês do plano), sem\n// depender de query pesada nem de o LLM fazer a conta.\n// Entrada esperada (item anterior no fluxo, ex: query de dívidas):\n//   { cpf, mes_do_plano, dividas: [ { banco, desconto_atual }, ... ] }\n// Saída: pacote pequeno e pronto pra ir direto no prompt do LLM.\n// ============================================================\n\n// Curva ILUSTRATIVA (os valores reais por credor são dados internos e foram removidos).\n// Formato: { \"<CREDOR>\": [desconto esperado no mês 1, mês 2, ..., mês 60] }\nconst CURVA_DESCONTO = {\"OUTROS\": [0.1, 0.12, 0.14, 0.16, 0.18, 0.2, 0.22, 0.24, 0.26, 0.28, 0.3, 0.32, 0.34, 0.36, 0.38, 0.4, 0.42, 0.44, 0.46, 0.48, 0.5, 0.52, 0.54, 0.56, 0.58, 0.6, 0.62, 0.64, 0.66, 0.68, 0.7, 0.72, 0.74, 0.76, 0.78, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]};\n\nfunction normalizarBanco(nome) {\n  return (nome || \"\").trim().toUpperCase();\n}\n\n// Índice normalizado pra tolerar variações de grafia (ITAÚ vs Itau vs itaú)\nconst CURVA_INDEX = Object.fromEntries(\n  Object.entries(CURVA_DESCONTO).map(([banco, valores]) => [normalizarBanco(banco), valores])\n);\n\nfunction buscarProjetado(banco, mesDoPlano) {\n  const chave = normalizarBanco(banco);\n  const valores = CURVA_INDEX[chave] || CURVA_INDEX[\"OUTROS\"];\n  if (!valores) return null;\n  const mes = Math.min(Math.max(mesDoPlano, 1), 60); // cap 1..60\n  return valores[mes - 1];\n}\n\nconst STATUS_DIVIDA_LABEL = {\n  em_aberto: 'em aberto',\n  paga: 'paga',\n  liquidada: 'liquidada',\n  liquidada_por_credito: 'liquidada por crédito',\n  estruturada: 'estruturada',\n  desconhecido: 'com estado desconhecido'\n};\n\nfunction gerarComparacaoTexto(status, tendenciaCurva, projetado, atual) {\n  if (status === 'sem_curva') return 'Sem curva de referência para esse credor.';\n  if (status === 'abaixo_do_esperado') return 'Desconto atual abaixo do projetado para o mês.';\n  if (status === 'acima_do_esperado') return 'Desconto atual acima do projetado para o mês.';\n  return 'Desconto dentro do projetado para o mês.';\n}\n\nfunction gerarNotaFinal(statusDivida, prazoStatus) {\n  if (statusDivida !== 'em_aberto') {\n    return `Dívida já ${STATUS_DIVIDA_LABEL[statusDivida] || statusDivida}.`;\n  }\n  if (prazoStatus === 'atrasado') return 'Atenção: o prazo de quitação combinado já passou.';\n  return 'Dentro do prazo e da margem esperada da curva.';\n}\n\nconst input = $input.first().json;\nconst mesDoPlano = input.mes_do_plano;\n\n// Data base do programa (mesma regra usada no BigQuery pra calcular mes_do_plano):\n// usa a data do aditivo se teve, senão a data de início do plano.\nconst dataBaseProgramaStr = (input.teve_aditivo && input.data_aditivo)\n  ? input.data_aditivo\n  : input.data_inicio;\n\n// Diferença em meses de calendário entre duas datas (equivalente ao\n// DATE_DIFF(..., MONTH) do BigQuery — ignora o dia, só conta virada de mês/ano)\nfunction diffMesesCalendario(dataFimStr, dataInicioStr) {\n  if (!dataFimStr || !dataInicioStr) return null;\n  const fim = new Date(dataFimStr);\n  const inicio = new Date(dataInicioStr);\n  if (isNaN(fim) || isNaN(inicio)) return null;\n  return (fim.getFullYear() - inicio.getFullYear()) * 12 + (fim.getMonth() - inicio.getMonth());\n}\n\n// Texto resumido pro topo do card, só pra dívidas já pagas (e equivalentes:\n// liquidada / liquidada_por_credito, que contam como a mesma coisa)\nfunction gerarStatusResumoPago(prazoStatus, diffPP) {\n  // Só esconde de verdade se não tiver NENHUM dos dois dados\n  if (prazoStatus == null && diffPP == null) return null;\n\n  let descontoTexto = 'dentro do esperado';\n  if (diffPP != null) {\n    if (diffPP > 3) descontoTexto = `${diffPP} p.p. acima do esperado`;\n    else if (diffPP < -3) descontoTexto = `${Math.abs(diffPP)} p.p. abaixo do esperado`;\n  }\n\n  // Sem prazo previsto (ex: dívida entrou via aditivo, nunca teve\n  // settlement_month registrado) — mostra só o desconto\n  if (prazoStatus == null) {\n    return `Quitada com desconto ${descontoTexto}`;\n  }\n\n  const prazoTexto = prazoStatus === 'no_prazo'\n    ? 'dentro do prazo previsto'\n    : 'após o prazo previsto';\n\n  return `Quitada ${prazoTexto} · desconto ${descontoTexto}`;\n}\n\nconst dividasComparadas = (input.dividas || []).map(d => {\n  // \"paga\", \"liquidada\" e \"liquidada_por_credito\" contam como a mesma coisa\n  // pra fins de travar o mês na quitação e calcular o resumo de status\n  const dividaJaPaga = d.status_divida === 'paga'\n    || d.status_divida === 'liquidada'\n    || d.status_divida === 'liquidada_por_credito';\n\n  // Pra dívida já paga/liquidada: trava o \"mês\" no momento da quitação (não\n  // no mês atual do cliente, que continua subindo mesmo depois que a dívida\n  // já foi resolvida). Pras demais: mantém o comportamento original.\n  let mesParaCurva;\n  if (dividaJaPaga && d.data_ultima_atualizacao_divida && dataBaseProgramaStr) {\n    // Mesma regra do BigQuery: sem aditivo, o mês de entrada (ativação) não conta.\n    const ajusteMes = (input.teve_aditivo && input.data_aditivo) ? 1 : 0;\n    const mesCalculado = diffMesesCalendario(d.data_ultima_atualizacao_divida, dataBaseProgramaStr) + ajusteMes;\n    mesParaCurva = Math.min(Math.max(mesCalculado, 1), 60);\n  } else {\n    mesParaCurva = d.mes_da_divida || mesDoPlano;\n  }\n\n  const chave = normalizarBanco(d.banco);\n  const valores = CURVA_INDEX[chave] || CURVA_INDEX[\"OUTROS\"];\n  const projetado = buscarProjetado(d.banco, mesParaCurva);\n  const atual = d.desconto_atual;\n  const diffPP = projetado != null ? Math.round((atual - projetado) * 1000) / 10 : null;\n\n  let tendenciaCurva = \"estavel\";\n  if (valores) {\n    const mesAtualIdx = Math.min(Math.max(mesParaCurva, 1), 60) - 1;\n    const proximosMeses = valores.slice(mesAtualIdx, Math.min(mesAtualIdx + 6, 60));\n    if (proximosMeses.some(v => v > valores[mesAtualIdx] + 0.02)) {\n      tendenciaCurva = \"subindo\";\n    }\n  }\n\n  const prazoPrevisto = d.mes_previsto_quitacao;\n  const prazoStatus = prazoPrevisto == null ? null\n    : mesParaCurva <= prazoPrevisto ? \"no_prazo\"\n    : \"atrasado\";\n  const mesesParaPrazo = prazoPrevisto != null ? prazoPrevisto - mesParaCurva : null;\n\n  // Se o pago total atualização (com comissão) ficou MAIOR que o pago total\n  // plano, isso é ruim de verdade — não importa o que a curva diga, não pode\n  // aparecer como \"acima do esperado\"\n  const piorouVsPlano = d.pago_total_atualizacao != null && d.pago_total_padrao != null\n    && d.pago_total_atualizacao > d.pago_total_padrao;\n\n  const status = piorouVsPlano ? \"abaixo_do_esperado\"\n    : diffPP == null ? \"sem_curva\"\n    : diffPP < -3 ? \"abaixo_do_esperado\"\n    : diffPP > 3 ? \"acima_do_esperado\"\n    : \"dentro_do_esperado\";\n\n  return {\n    banco: d.banco,\n    desconto_atual: atual,\n    desconto_projetado: projetado,\n    diff_pp: diffPP,\n    valor_original: d.valor_original,\n    pago_banco_plano: d.pago_banco_plano,\n    valor_pago_banco_atual: d.valor_pago_banco_atual,\n    current_balance_postgres: d.current_balance_postgres,\n    pago_total_padrao: d.pago_total_padrao,\n    pago_total_atualizacao: d.pago_total_atualizacao,\n    comissao_sucesso: d.comissao_sucesso,\n    comissao_sucesso_atualizada: d.comissao_sucesso_atualizada,\n    estado_divida_raw: d.estado_divida_raw,\n    status_divida: d.status_divida,\n    liquidado_com_credito: d.liquidado_com_credito,\n    data_ultima_atualizacao_divida: d.data_ultima_atualizacao_divida,\n    mes_previsto_quitacao: prazoPrevisto,\n    numero_contrato: d.numero_contrato,\n    prazo_status: prazoStatus,\n    meses_para_prazo: mesesParaPrazo,\n    mes_da_divida: mesParaCurva,\n    origem_ingresso_divida: d.origem_ingresso_divida,\n    mes_entrada_no_cliente: d.mes_entrada_no_cliente,\n    tendencia_curva: tendenciaCurva,\n    status: status,\n    comparacao_texto: gerarComparacaoTexto(status, tendenciaCurva, projetado, atual, piorouVsPlano),\n    nota_final: gerarNotaFinal(d.status_divida, prazoStatus),\n    status_resumo_pago: dividaJaPaga ? gerarStatusResumoPago(prazoStatus, diffPP) : null,\n    parcelas_estruturado: d.parcelas_estruturado\n  };\n});\n\nreturn [{\n  json: {\n    br: input.br,\n    nome_cliente: input.nome_cliente,\n    status_berex: input.status_berex,\n    sub_state: input.sub_state,\n    data_inicio: input.data_inicio,\n    mes_do_plano: mesDoPlano,\n    duracao_programa: input.duracao_programa,\n    divida_total: input.divida_total,\n    aporte_mensal: input.aporte_mensal,\n    qtd_dividas: input.qtd_dividas,\n    parcelas_esperadas: input.parcelas_esperadas,\n    parcelas_pagas: input.parcelas_pagas,\n    teve_aditivo: input.teve_aditivo,\n    data_aditivo: input.data_aditivo,\n    data_ultima_atualizacao_plano: input.data_ultima_atualizacao_plano,\n    atualizado_ultimos_45_dias: input.atualizado_ultimos_45_dias,\n    ultima_atualizacao_dividas: input.ultima_atualizacao_dividas,\n    poupanca_total: input.poupanca_total,\n    pago_total: input.pago_total,\n    pago_banco_total_plano: input.pago_banco_total_plano,\n    desconto_total_plano: input.desconto_total_plano,\n    dividas: dividasComparadas\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        0
+      ],
+      "id": "20d0f0d1-689d-4435-82f2-c2082ef956e2",
+      "name": "CurvadeDesconto"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=={{ JSON.stringify({\n  mes_do_plano: $json.mes_do_plano,\n  duracao_programa: $json.duracao_programa,\n  parcelas_esperadas: $json.parcelas_esperadas,\n  parcelas_pagas: $json.parcelas_pagas,\n  teve_aditivo: $json.teve_aditivo,\n  data_aditivo: $json.data_aditivo,\n  atualizado_ultimos_45_dias: $json.atualizado_ultimos_45_dias,\n  dividas: $json.dividas.map(d => ({\n    banco: d.banco,\n    status_divida: d.status_divida,\n    prazo_status: d.prazo_status,\n    status: d.status\n  }))\n}) }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Você é um assistente de SC da Bravo. Você recebe dados já calculados do plano de um cliente, incluindo a lista completa de dívidas (já com status, prazo e comparação com a curva calculados).  Responda APENAS com um JSON no formato: {   \"insights\": [{\"text\": \"...\", \"tipo\": \"alerta\npositivo\nnormal\"}],   \"fala_sugerida_geral\": \"...\" }  Regras estritas: - No MÁXIMO 4 insights, cada um com no máximo 1 frase curta. - NUNCA inclua valores monetários exatos ou porcentagens nos insights — isso já aparece em outro   lugar da tela. Fale de padrões (ex: \"várias dívidas atrasadas\"), não de números específicos. - \"fala_sugerida_geral\": UM parágrafo curto (máximo 4 frases), em primeira pessoa do plural (\"nós\"),   cobrindo o panorama geral (dívidas em aberto vs. resolvidas, se houve aditivo, se há atraso).   Tom acolhedor e transparente. Sem números exatos, só o panorama.  Sem markdown, sem texto antes ou depois do JSON."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1296,
+        0
+      ],
+      "id": "5d68a58f-e42c-4f58-8087-7d83929ad247",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-6-luna",
+          "mode": "list",
+          "cachedResultName": "GPT-6-LUNA"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        1296,
+        208
+      ],
+      "id": "81eeeab1-bb3e-4dea-ba06-36e7b3330db2",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2656,
+        -16
+      ],
+      "id": "7d30765c-0830-43a1-8521-cb2b11b16c8f",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.text;\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  throw new Error('LLM não retornou JSON válido: ' + raw);\n}\n\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1648,
+        0
+      ],
+      "id": "d3530065-5513-444c-870f-0ca34e6ebf87",
+      "name": "Parsear resposta do LLM"
+    },
+    {
+      "parameters": {
+        "jsCode": "const dadosEstruturados = $('CurvadeDesconto').first().json;\nconst llmOutput = $input.first().json;\n\nfunction paraNumero(v) {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(v);\n  return isNaN(n) ? null : n;\n}\n\nfunction paraBooleano(v) {\n  return v === true || v === 'true';\n}\n\n// NOVO — tags vêm direto do AgruparDividas (o CurvadeDesconto não repassa).\n// Casa por banco + valor_original, que é único por dívida na prática.\nconst tagsPorDivida = {};\nfor (const dv of ($('AgruparDividas').first().json.dividas || [])) {\n  const chave = `${dv.banco}|${Number(dv.valor_original).toFixed(2)}`;\n  tagsPorDivida[chave] = {\n    acordo_quebrado: paraBooleano(dv.acordo_quebrado),\n    labels: Array.isArray(dv.labels) ? dv.labels : []\n  };\n}\nfunction buscarTags(d) {\n  const chave = `${d.banco}|${Number(d.valor_original).toFixed(2)}`;\n  return tagsPorDivida[chave] || { acordo_quebrado: false, labels: [] };\n}\n\nreturn [{\n  json: {\n    br: dadosEstruturados.br,\n    nome_cliente: dadosEstruturados.nome_cliente,\n    status_berex: dadosEstruturados.status_berex,\n    sub_state: dadosEstruturados.sub_state,\n    mes_do_plano: paraNumero(dadosEstruturados.mes_do_plano),\n    duracao_programa: paraNumero(dadosEstruturados.duracao_programa),\n    divida_total: paraNumero(dadosEstruturados.divida_total),\n    aporte_mensal: paraNumero(dadosEstruturados.aporte_mensal),\n    qtd_dividas: paraNumero(dadosEstruturados.qtd_dividas),\n    parcelas_esperadas: paraNumero(dadosEstruturados.parcelas_esperadas),\n    parcelas_pagas: paraNumero(dadosEstruturados.parcelas_pagas),\n    teve_aditivo: paraBooleano(dadosEstruturados.teve_aditivo),\n    data_aditivo: dadosEstruturados.data_aditivo,\n    data_ultima_atualizacao_plano: dadosEstruturados.data_ultima_atualizacao_plano,\n    atualizado_ultimos_45_dias: paraBooleano(dadosEstruturados.atualizado_ultimos_45_dias),\n    ultima_atualizacao_dividas: dadosEstruturados.ultima_atualizacao_dividas,\n    poupanca_total: paraNumero(dadosEstruturados.poupanca_total),\n    pago_total: paraNumero(dadosEstruturados.pago_total),\n    pago_banco_total_plano: paraNumero(dadosEstruturados.pago_banco_total_plano),\n    desconto_total_plano: paraNumero(dadosEstruturados.desconto_total_plano),\n    dividas: (dadosEstruturados.dividas || []).map(d => {\n      const tags = buscarTags(d); // NOVO\n      return {\n        banco: d.banco,\n        desconto_atual: paraNumero(d.desconto_atual),\n        desconto_projetado: paraNumero(d.desconto_projetado),\n        diff_pp: paraNumero(d.diff_pp),\n        valor_original: paraNumero(d.valor_original),\n        pago_banco_plano: paraNumero(d.pago_banco_plano),\n        valor_pago_banco_atual: paraNumero(d.valor_pago_banco_atual),\n        current_balance_postgres: paraNumero(d.current_balance_postgres),\n        pago_total_padrao: paraNumero(d.pago_total_padrao),\n        pago_total_atualizacao: paraNumero(d.pago_total_atualizacao),\n        comissao_sucesso: paraNumero(d.comissao_sucesso),\n        comissao_sucesso_atualizada: paraNumero(d.comissao_sucesso_atualizada),\n        estado_divida_raw: d.estado_divida_raw,\n        status_divida: d.status_divida,\n        liquidado_com_credito: paraBooleano(d.liquidado_com_credito),\n        data_ultima_atualizacao_divida: d.data_ultima_atualizacao_divida,\n        mes_previsto_quitacao: paraNumero(d.mes_previsto_quitacao),\n        numero_contrato: d.numero_contrato,\n        prazo_status: d.prazo_status,\n        meses_para_prazo: paraNumero(d.meses_para_prazo),\n        mes_da_divida: paraNumero(d.mes_da_divida),\n        origem_ingresso_divida: d.origem_ingresso_divida,\n        mes_entrada_no_cliente: paraNumero(d.mes_entrada_no_cliente),\n        tendencia_curva: d.tendencia_curva,\n        status: d.status,\n        comparacao_texto: d.comparacao_texto,\n        nota_final: d.nota_final,\n        status_resumo_pago: d.status_resumo_pago,\n        parcelas_estruturado: d.parcelas_estruturado,\n        acordo_quebrado: paraBooleano(d.acordo_quebrado) || tags.acordo_quebrado, // NOVO\n        labels: (Array.isArray(d.labels) && d.labels.length) ? d.labels : tags.labels // NOVO\n      };\n    }),\n    insights: llmOutput.insights || []\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1872,
+        0
+      ],
+      "id": "5e24b991-460e-49e4-b7c0-27bf0464c32f",
+      "name": "CombinarDados"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4b32f50a-e911-4552-a9dc-7e327a6951f9",
+              "leftValue": "={{$json.atualizado_ultimos_45_dias}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2096,
+        0
+      ],
+      "id": "0825e889-43d5-4982-bdb3-d9fe27dc6ae6",
+      "name": "Verificar 45 Dias"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GOOGLE_CHAT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": \"⚠️ O código *{{ $json.br }}* está sem atualização de dívida há mais de 45 dias. Por favor, atualizar o plano do cliente e mandar mensagem aqui no grupo avisando.SLA:1 DIA.\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2320,
+        192
+      ],
+      "id": "74cc63b5-d01f-40fc-8870-711ac14cbbd5",
+      "name": "Avisar Grupo Negociação"
+    },
+    {
+      "parameters": {
+        "jsCode": "const dados = $('CombinarDados').first().json;\nreturn [{ json: dados }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2512,
+        192
+      ],
+      "id": "121c645a-c8c3-49c1-b838-b43348493980",
+      "name": "Restaurar dados clientes"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.METABASE_URL }}/api/card/<ID_DA_PERGUNTA>/query",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "metabaseApi",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={\n  \"parameters\": [\n    {\n      \"type\": \"category\",\n      \"id\": \"3d2d9081-777b-4909-a3ba-da6f8011403e\",\n      \"target\": [\"variable\", [\"template-tag\", \"br\"]],\n      \"value\": \"{{ $('validarBR').item.json.br }}\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        400,
+        112
+      ],
+      "id": "43ba21dc-9fe2-4cf5-98f8-73f34a0d508a",
+      "name": "BuscarDividasPostgres",
+      "retryOnFail": true,
+      "credentials": {
+        "metabaseApi": {
+          "id": "REPLACE_ME",
+          "name": "Metabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        640,
+        0
+      ],
+      "id": "60e6011d-17f0-4de2-b1b1-d3536c388948",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n\nconst SECRET = $env.SESSION_SECRET; // mesma chave do GerarSessao\n\nconst bodyRecebido = $('Webhook').first().json.body;\nconst tokenRecebido = bodyRecebido?.session_token || '';\nconst emailEsperado = (bodyRecebido?.session_email || '').trim().toLowerCase();\n\nconst partes = tokenRecebido.split('.');\n\nif (partes.length !== 2) {\n  return [{ json: { sessao_valida: false, erro: 'Sessão inválida. Faça login novamente.' } }];\n}\n\nconst [payload, assinatura] = partes;\nconst assinaturaEsperada = crypto.createHmac('sha256', SECRET).update(payload).digest('hex');\n\nif (assinatura !== assinaturaEsperada) {\n  return [{ json: { sessao_valida: false, erro: 'Sessão inválida. Faça login novamente.' } }];\n}\n\nconst decodificado = Buffer.from(payload, 'base64').toString('utf8');\nconst [emailNoToken, expiraEmStr] = decodificado.split('|');\n\nif (Number(expiraEmStr) < Date.now()) {\n  return [{ json: { sessao_valida: false, erro: 'Sessão expirada. Faça login novamente.' } }];\n}\n\nif (emailNoToken !== emailEsperado) {\n  return [{ json: { sessao_valida: false, erro: 'Sessão inválida. Faça login novamente.' } }];\n}\n\n// Sessão ok — repassa o BR (e o e-mail do operador, se quiser usar em logs no futuro)\nreturn [{ json: { sessao_valida: true, br: bodyRecebido.br, operador_email: emailNoToken } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        0
+      ],
+      "id": "0d355fcc-1de1-4cd3-b3f7-af8d80f4be92",
+      "name": "ValidarSessao"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4bf71ce8-92df-4d0c-a6ee-80d2026d0d3a",
+              "leftValue": "={{ $json.sessao_valida }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -64,
+        0
+      ],
+      "id": "5348a6a6-5977-4952-86eb-4fddf2a3debe",
+      "name": "SessaoValida?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        160,
+        176
+      ],
+      "id": "77fd5598-2bb8-46a4-a978-8c89a4fc9d88",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.APPS_SCRIPT_LOG_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ token: $env.APPS_SCRIPT_TOKEN, action: 'registrar_consulta', email: $('ValidarSessao').first().json.operador_email, br: $('validarBR').first().json.br }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2880,
+        -16
+      ],
+      "id": "a8922d28-9d56-4bb8-ba3f-149d3a2d224f",
+      "name": "RegistrarConsulta",
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "ValidarSessao",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "validarBR": {
+      "main": [
+        [
+          {
+            "node": "BuscarDividasCliente",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "BuscarDividasPostgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BuscarDividasCliente": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AgruparDividas": {
+      "main": [
+        [
+          {
+            "node": "CurvadeDesconto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CurvadeDesconto": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Parsear resposta do LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parsear resposta do LLM": {
+      "main": [
+        [
+          {
+            "node": "CombinarDados",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CombinarDados": {
+      "main": [
+        [
+          {
+            "node": "Verificar 45 Dias",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar 45 Dias": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Avisar Grupo Negociação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avisar Grupo Negociação": {
+      "main": [
+        [
+          {
+            "node": "Restaurar dados clientes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restaurar dados clientes": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BuscarDividasPostgres": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "AgruparDividas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ValidarSessao": {
+      "main": [
+        [
+          {
+            "node": "SessaoValida?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SessaoValida?": {
+      "main": [
+        [
+          {
+            "node": "validarBR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook": {
+      "main": [
+        [
+          {
+            "node": "RegistrarConsulta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "timezone": "America/Sao_Paulo",
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 900
+  }
+}
