@@ -21,8 +21,7 @@ O Copiloto reúne em uma única tela informações que antes ficavam espalhadas 
 - [Regras de negócio](#regras-de-negócio)
 - [Deploy](#deploy)
 - [Troubleshooting e armadilhas conhecidas](#troubleshooting-e-armadilhas-conhecidas)
-- [Limitações conhecidas](#limitações-conhecidas)
-- [Pendências / roadmap](#pendências--roadmap)
+
 
 ---
 
